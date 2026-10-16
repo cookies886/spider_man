@@ -1,0 +1,131 @@
+name: Tests and package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'quit(db.adminCommand({ping: 1}).ok ? 0 : 1)'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      SPIDER_MAN_TEST_MONGO_URI: mongodb://127.0.0.1:27017
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install isolated Redis test server
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends redis-server
+          redis-server --version
+
+      - name: Install package, tests, and build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test,build]"
+          python -m pip check
+
+      - name: Run tests with real Redis and MongoDB
+        run: |
+          python -m pytest -q --junitxml=test-results.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          report = ET.parse("test-results.xml")
+          assert not report.findall(".//skipped"), "Integration tests must not be skipped in CI"
+          PY
+
+      - name: Build wheel and source distribution
+        run: |
+          python -m build
+          python -m twine check --strict dist/*
+
+      - name: Check distribution contents
+        run: |
+          python - <<'PY'
+          from email.parser import Parser
+          from pathlib import Path, PurePosixPath
+          import tarfile
+          import zipfile
+
+          wheels = list(Path("dist").glob("*.whl"))
+          sources = list(Path("dist").glob("*.tar.gz"))
+          assert len(wheels) == len(sources) == 1
+          expected = {path.as_posix() for path in Path("spider_man").rglob("*.py")}
+          with zipfile.ZipFile(wheels[0]) as archive:
+              files = {name for name in archive.namelist() if not name.endswith("/")}
+              metadata_files = [name for name in files if name.endswith(".dist-info/METADATA")]
+              assert len(metadata_files) == 1
+              metadata = Parser().parsestr(archive.read(metadata_files[0]).decode("utf-8"))
+              assert metadata["Name"] == "spider-man"
+              dist_info = f"spider_man-{metadata['Version']}.dist-info"
+              assert {name for name in files if name.startswith("spider_man/")} == expected
+              assert all(
+                  name.startswith("spider_man/")
+                  or PurePosixPath(name).parts[0] == dist_info
+                  for name in files
+              ), "Wheel must contain only SDK modules and distribution metadata"
+          with tarfile.open(sources[0]) as archive:
+              files = {
+                  PurePosixPath(*PurePosixPath(member.name).parts[1:]).as_posix()
+                  for member in archive.getmembers() if member.isfile()
+              }
+              allowed = {"MANIFEST.in", "pyproject.toml", "README.md", "PKG-INFO", "setup.cfg"}
+              allowed.update(
+                  "spider_man.egg-info/" + name
+                  for name in ("PKG-INFO", "SOURCES.txt", "dependency_links.txt", "entry_points.txt",
+                               "requires.txt", "top_level.txt")
+              )
+              assert all(
+                  name in allowed or name in expected
+                  for name in files
+              ), "Source distribution must exclude examples, reports, credentials, and local state"
+              assert expected <= files
+          PY
+
+      - name: Install wheel into a clean environment
+        run: |
+          wheel_env="$RUNNER_TEMP/spider-man-wheel"
+          python -m venv "$wheel_env"
+          "$wheel_env/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$wheel_env/bin/python" - <<'PY'
+          import importlib.metadata
+          import spider_man
+          from spider_man import Crawler, Item, Request, Response, Seed
+
+          assert importlib.metadata.version("spider-man") == spider_man.__version__
+          app = Crawler("package", "smoke")
+          assert app.todo_key == "{package:smoke}:todo"
+          app.close()
+          PY
+          "$wheel_env/bin/spider-man" --help
+          "$wheel_env/bin/python" -m spider_man --help

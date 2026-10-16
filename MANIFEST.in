@@ -1,0 +1,7 @@
+# Distribute the SDK and build metadata; local examples, reports, and state stay out.
+global-exclude *
+include MANIFEST.in
+include pyproject.toml
+include README.md
+recursive-include spider_man *.py
+global-exclude *.py[cod]

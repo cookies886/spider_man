@@ -1,0 +1,13 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["127.0.0.1:16379:6379"]
+    volumes: ["redis_data:/data"]
+  mongo:
+    image: mongo:7.0
+    ports: ["127.0.0.1:17017:27017"]
+    volumes: ["mongo_data:/data/db"]
+volumes:
+  redis_data:
+  mongo_data:
